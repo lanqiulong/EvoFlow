@@ -229,6 +229,8 @@ export default defineConfig({
       'tests/task-duration.test.js',
       'tests/replay-real-run-133609527d1f.test.js',
       'tests/replay-real-run-81320d61e8cc-diag.test.js',
+      // 唤醒词 Web Speech 采集失败退避/停耳（BUG修复回归测试）
+      'tests/wake-word-webspeech-backoff.test.js',
     ],
   },
 })

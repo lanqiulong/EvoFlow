@@ -299,6 +299,12 @@ export async function startWebSpeechEar() {
     rec.onresult = (event) => {
       if (!running) return
       lastResultAt = Date.now()
+      // 【BUG修复】收到真实识别结果 = 麦克风确实可用，才清零采集失败计数与退避窗口，
+      // 让下一次硬失败能重新从 streak=1 起算（否则退避会永久卡死在历史残值上）。
+      if (captureFailStreak > 0 || captureBackoffUntil > 0) {
+        captureFailStreak = 0
+        captureBackoffUntil = 0
+      }
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i]
         if (!result) continue
@@ -390,10 +396,10 @@ export async function startWebSpeechEar() {
         if (!running) return
         try {
           rec.start()
-          // 成功续听后清采集失败计数
-          if (captureFailStreak > 0 && Date.now() >= captureBackoffUntil) {
-            captureFailStreak = 0
-          }
+          // 【BUG修复】此处不再清零 captureFailStreak：
+          // Chrome 无麦时 start() 不会同步抛异常，真正的失败以异步 onerror(audio-capture) 到达。
+          // 旧逻辑只要 start() 返回就清零，导致 streak 恒为 1，退避档位与停耳阈值双双失效。
+          // 清零改由 onresult（真实识别结果 = 麦确实可用）触发。
         } catch {
           setTimeout(() => {
             if (!running) return

@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **语音唤醒卡顿（唤醒耳采集失败无限重试）**：麦克风不可用/被占用时，Chrome 的 `SpeechRecognition.start()` 不会同步抛错，真正的失败以异步 `onerror(audio-capture)` 到达。旧逻辑只要 `start()` 返回就清零 `captureFailStreak`，导致失败计数恒为 1——退避档位永远停在 3s（升不到 30s）、停耳阈值（连续 8 次硬失败即停用唤醒耳）永远达不成，唤醒耳每 3s 重试一次并刷 `/speech/log`，长期拖慢主线程与 Gateway。现改为仅在 `onresult`（麦克风确实吐出识别结果）时清零失败计数与退避窗口，使退避能正常升级、达到阈值后自动停耳。
+- 补充回归测试 `tests/wake-word-webspeech-backoff.test.js`：覆盖「连续硬失败达阈值停耳」「退避随失败次数递增」「`onresult` 后清零重算」三条路径，确保该缺陷不在后续版本复现。
+
 ## [1.2.3] - 2026-10-31
 
 相对 **1.2.2**：飞书/渠道图片可收可发、聊天发送更跟手；任务中心与侧栏不再拖死聊天；子代理侧栏与停止行为修好；工作流列表换成稳定 SVG 图标。
