@@ -342,19 +342,30 @@ pub fn wake_kws_start(
 
 /// Feed one PCM chunk (base64 Float32 LE @ 16 kHz).
 #[tauri::command]
-pub fn wake_kws_feed_pcm(state: State<'_, WakeKwsState>, b64: String) -> Result<(), String> {
+// 【BUG修复】原为同步命令：Tauri 的同步 #[tauri::command] 在 WebView UI 主线程执行，
+// stdin write/flush 一旦因 sidecar 停顿（管道缓冲写满）阻塞，整个窗口画面冻结。
+// 改为 async + spawn_blocking，把阻塞 IO 挪到 Tauri 阻塞池，复用 browser_cdp_command 的既有模式。
+// 前端 wake-word-native.js 的 feedBusy 保证同一时刻只有 1 个在途 feed，写入顺序不变。
+pub async fn wake_kws_feed_pcm(app: AppHandle, b64: String) -> Result<(), String> {
   if b64.is_empty() {
     return Ok(());
   }
-  let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
-  let Some(sess) = guard.as_mut() else {
-    return Ok(());
-  };
-  if !sess.ready {
-    return Ok(());
-  }
-  let msg = serde_json::json!({ "type": "pcm", "b64": b64 });
-  write_line(&mut sess.stdin, &msg)
+  // 【BUG修复】State<'_> 的借用生命周期无法跨线程，改用 'static 的 AppHandle 在闭包内取 state
+  tauri::async_runtime::spawn_blocking(move || {
+    let state = app.state::<WakeKwsState>();
+    let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
+    let Some(sess) = guard.as_mut() else {
+      return Ok(());
+    };
+    if !sess.ready {
+      return Ok(());
+    }
+    let msg = serde_json::json!({ "type": "pcm", "b64": b64 });
+    // 【BUG修复】阻塞写管道现在跑在阻塞池，不再占用 UI 主线程
+    write_line(&mut sess.stdin, &msg)
+  })
+  .await
+  .map_err(|e| format!("wake_kws_feed_pcm join failed: {e}"))?
 }
 
 #[tauri::command]
