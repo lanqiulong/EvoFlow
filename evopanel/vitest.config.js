@@ -232,6 +232,8 @@ export default defineConfig({
       // 唤醒词 Web Speech 采集失败退避/停耳（BUG修复回归测试）
       'tests/wake-word-webspeech-backoff.test.js',
       'tests/wake-kws-feed-pcm-blocking.test.js',
+      // 前端 console→文件日志重复行节流（卡顿修复回归测试）
+      'tests/console-file-log-repeat.test.js',
     ],
   },
 })

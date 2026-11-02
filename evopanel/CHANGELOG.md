@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **语音唤醒卡顿（唤醒耳采集失败无限重试）**：麦克风不可用/被占用时，Chrome 的 `SpeechRecognition.start()` 不会同步抛错，真正的失败以异步 `onerror(audio-capture)` 到达。旧逻辑只要 `start()` 返回就清零 `captureFailStreak`，导致失败计数恒为 1——退避档位永远停在 3s（升不到 30s）、停耳阈值（连续 8 次硬失败即停用唤醒耳）永远达不成，唤醒耳每 3s 重试一次并刷 `/speech/log`，长期拖慢主线程与 Gateway。现改为仅在 `onresult`（麦克风确实吐出识别结果）时清零失败计数与退避窗口，使退避能正常升级、达到阈值后自动停耳。
 - 补充回归测试 `tests/wake-word-webspeech-backoff.test.js`：覆盖「连续硬失败达阈值停耳」「退避随失败次数递增」「`onresult` 后清零重算」三条路径，确保该缺陷不在后续版本复现。
+- **前端日志风暴拖慢桌面端**：`console.*` 镜像到 `~/.evoflow/logs/frontend-*.log` 时新增重复行节流（同 level + 同文本 5s 窗口内合并，窗口过期后放行一条并补「同类日志重复 N 条已省略」汇总）。此前任何一类刷屏（唤醒耳错误、SSE 每开一条打一行等）都会逐条走 Tauri `append_frontend_log` 写盘，实测单日可达 1.7M 行 / 数百 MB，直接抬高主线程与 Gateway 负载。指纹表设 64 条上限并按最早插入淘汰，长跑不涨内存；保留放行心跳，不会把持续故障误报成已恢复。
 
 ## [1.2.3] - 2026-10-31
 
