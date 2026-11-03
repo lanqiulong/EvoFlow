@@ -188,6 +188,14 @@ function rejectUnauthorized(res) {
   res.end('Authentication required (EvoFlow WebUI proxy)\n');
 }
 
+// 【修复A】上游防护：并发上限 + 僵尸连接空闲超时。
+// gateway limit_concurrency=384（Windows select FD 512，调不高）。代理自限 MAX_UPSTREAM，
+// 超限直接 503+Retry-After（不占上游槽位），保证 /health 等关键请求永远有槽；
+// SSE/WS 双向无数据超过 IDLE_MS 视为僵尸连接掐断（半开 TCP 收不到 close 事件，只能靠应用层超时清）。
+const MAX_UPSTREAM = Number(process.env.EVOWEB_MAX_UPSTREAM || 300);
+const IDLE_MS = Number(process.env.EVOWEB_IDLE_MS || 600000);
+let activeUpstream = 0;
+
 function handleRequest(req, res) {
   const ip = clientIp(req.socket);
   // 【BUG修复】自环兜底：入站请求已带本代理标记，说明它在转发链路里又回到自己，
@@ -226,15 +234,40 @@ function handleRequest(req, res) {
     headers: req.headers,
   };
 
+  // 【修复A】并发上限：超限先在代理层挡下，不去挤 gateway 槽位
+  if (activeUpstream >= MAX_UPSTREAM) {
+    log('THROTTLE ' + req.method + ' ' + req.url + ' from ' + ip + ' active=' + activeUpstream);
+    res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': '2' });
+    res.end("proxy upstream concurrency limit reached" + String.fromCharCode(10));
+    req.resume(); // 丢弃请求体，防客户端阻塞
+    return;
+  }
+  activeUpstream++;
+  let counted = true;
+  const release = () => { if (counted) { counted = false; activeUpstream--; } };
+  // 【修复A】空闲定时器：任一方向有数据就重置；超时=僵尸连接，双向掐断
+  let idleTimer = null;
+  const armIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      log('IDLE-KILL ' + req.method + ' ' + req.url + ' from ' + ip + ' (no data ' + Math.round(IDLE_MS / 1000) + 's)');
+      try { proxyReq.destroy(); } catch (e) {}
+      try { res.destroy(); } catch (e) {}
+    }, IDLE_MS);
+  };
+  const disarmIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+  armIdle();
   const proxyReq = http.request(opts, (proxyRes) => {
     const headers = Object.assign({}, proxyRes.headers);
     if (grantCookie) headers['set-cookie'] = [sessionCookie()];
     res.writeHead(proxyRes.statusCode || 502, headers);
     proxyRes.pipe(res);
+    proxyRes.on('data', armIdle); // 【修复A】流式响应有数据就重置空闲计时
     log(`OK    ${req.method} ${req.url} from ${ip} -> ${proxyRes.statusCode}`);
   });
 
   proxyReq.on('error', (err) => {
+    release(); disarmIdle(); // 【修复A】释放并发计数与定时器
     log(`UPSTREAM-ERR ${req.method} ${req.url} from ${ip}: ${err && err.message}`);
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' });
@@ -248,9 +281,10 @@ function handleRequest(req, res) {
   // 累积顶满后 gateway 对一切请求返回 503（两次假死的直接推手）。
   const abortUp = () => { try { proxyReq.destroy(); } catch (e) {} };
   req.on('aborted', abortUp);
-  res.on('close', abortUp); // 正常完成也会触发，销毁已完成请求无害
+  res.on('close', () => { abortUp(); release(); disarmIdle(); }); // 【修复A】完成/断开都释放计数与定时器
   // 关闭 Nagle，利于 SSE 流式响应及时下发
   if (req.socket) req.socket.setNoDelay(true);
+  req.on('data', armIdle); // 【修复A】上传流也算活跃
   req.pipe(proxyReq);
 }
 
@@ -286,6 +320,25 @@ function handleUpgrade(req, clientSocket, head, viaTls) {
   }
   const banner = Buffer.from(lines.join('\r\n') + '\r\n\r\n', 'latin1');
 
+  // 【修复A】WS 同样占 gateway 槽位：计数 + 超限拒绝 + 双向空闲超时
+  if (activeUpstream >= MAX_UPSTREAM) {
+    log('THROTTLE-WS ' + req.url + ' from ' + ip + ' active=' + activeUpstream);
+    clientSocket.write(["HTTP/1.1 503 Service Unavailable","retry-after: 2","content-length: 0","connection: close","",""].join(String.fromCharCode(13,10)));
+    try { clientSocket.destroy(); } catch (e) {}
+    return;
+  }
+  activeUpstream++;
+  let wsCounted = true;
+  const wsRelease = () => { if (wsCounted) { wsCounted = false; activeUpstream--; } };
+  let wsIdle = null;
+  const armWsIdle = () => {
+    if (wsIdle) clearTimeout(wsIdle);
+    wsIdle = setTimeout(() => {
+      log('IDLE-KILL-WS ' + req.url + ' from ' + ip + ' (no data ' + Math.round(IDLE_MS / 1000) + 's)');
+      bye();
+    }, IDLE_MS);
+  };
+  armWsIdle();
   const upstream = net.connect(TARGET_PORT, tHost || '127.0.0.1', () => {
     upstream.write(banner);
     if (head && head.length) upstream.write(head);
@@ -294,6 +347,7 @@ function handleUpgrade(req, clientSocket, head, viaTls) {
   });
 
   const bye = () => {
+    if (wsIdle) { clearTimeout(wsIdle); wsIdle = null; } wsRelease(); // 【修复A】释放 WS 计数与定时器
     try { upstream.destroy(); } catch (e) {}
     try { clientSocket.destroy(); } catch (e) {}
   };
@@ -302,6 +356,7 @@ function handleUpgrade(req, clientSocket, head, viaTls) {
   // 【BUG修复】pipe 不传播 destroy：WS 客户端断开时上游也要关，否则 gateway WS 槽位泄漏
   clientSocket.on('close', bye);
   upstream.on('close', bye);
+  upstream.on('data', armWsIdle); clientSocket.on('data', armWsIdle); // 【修复A】双向有数据就重置
   upstream.setTimeout(0);
   clientSocket.setTimeout(0);
   log(`WS    ${req.url} from ${ip}`);
