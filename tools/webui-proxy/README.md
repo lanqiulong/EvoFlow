@@ -35,3 +35,10 @@
     Get-Content watchdog.log -Tail 20          # 探活与修复明细
 
 状态文件：watchdog-state.json / gateway-sentinel-state.json；日志 >2MB 自动滚 .log.1。
+
+## 可调环境变量（proxy.js）
+
+- EVOWEB_MAX_UPSTREAM  上游并发自限，默认 300（gateway 硬上限 384，留余量保 /health）
+- EVOWEB_IDLE_MS       SSE/WS 双向空闲超时毫秒，默认 600000（10 分钟无数据掐僵尸连接）
+- EVOWEB_GATEWAY_LOG_DIR  哨兵 gateway 日志目录（SYSTEM 计划任务下必配）
+
